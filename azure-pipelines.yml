@@ -1,0 +1,95 @@
+# Build and deploy updated code to a Cloud Services Extended Support instance
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  cloudServiceProject: '**/*.ccproj'
+  targetProfile: 'Cloud'
+
+jobs:
+- job: cloudservicebuild
+  pool:
+    vmImage: 'windows-latest'
+
+  steps:
+  - task: NuGetToolInstaller@0
+    displayName: 'Use NuGet 4.4.1'
+    inputs:
+      versionSpec: 4.4.1
+
+  - task: NuGetCommand@2
+    displayName: 'NuGet restore'
+    inputs:
+      restoreSolution: '$(solution)'
+
+  - task: VSBuild@1
+    displayName: 'Build solution **\*.sln'
+    inputs:
+      solution: '$(solution)'
+      platform: '$(buildPlatform)'
+      configuration: '$(buildConfiguration)'
+
+  - task: VSBuild@1
+    displayName: 'Build solution **\*.ccproj'
+    inputs:
+      solution: '$(cloudServiceProject)'
+      msbuildArgs: '/t:Publish /p:TargetProfile=$(targetProfile) /p:DebugType=None /p:SkipInvalidConfigurations=true /p:OutputPath=bin\ /p:PublishDir="$(build.artifactstagingdirectory)\\"'
+      platform: '$(buildPlatform)'
+      configuration: '$(buildConfiguration)'
+
+  - task: PublishSymbols@2
+    displayName: 'Publish symbols path'
+    inputs:
+      SearchPattern: '**\bin\**\*.pdb'
+      PublishSymbols: false
+    continueOnError: true
+ 
+  - task: PublishPipelineArtifact@1
+    inputs:
+      targetPath: '$(Pipeline.Workspace)'
+      artifact: 'cloudserviceproject'
+      publishLocation: 'pipeline'
+
+- deployment: DeployCloudService
+  dependsOn: cloudservicebuild
+  displayName: deploy Cloud Services Extended Support
+  pool:
+    vmImage: 'windows-latest'
+  # Creates an environment if it doesn't exist.
+  environment: 'cloudservicedeployment'
+  strategy:
+    # Default deployment strategy, more coming...
+    runOnce:
+      deploy:
+        steps:
+        # Copy package file to blob storage
+        - task: AzureFileCopy@4
+          name: 'UploadCSPkg'
+          displayName: 'AzureBlob File Copy'
+          inputs:
+            SourcePath: '$(Pipeline.Workspace)\cloudserviceproject\a\CloudServiceToDeploy.cspkg'
+            azureSubscription: '{your Azure subscription service connection here}'
+            Destination: AzureBlob
+            storage: {your storage account name here}
+            ContainerName: psdeploy
+            BlobPrefix: CloudServiceToDeploy.cspkg
+        # Update cloud service extended support instance
+        - task: AzurePowerShell@5
+          displayName: 'Azure PowerShell script: InlineScript'
+          inputs:
+            azureSubscription: '{your Azure subscription service connection here}'
+            ScriptType: InlineScript
+            Inline: |
+              $cspkgUrl = '$(UploadCSPkg.StorageContainerUri)CloudServiceToDeploy.cspkg$(UploadCSPkg.StorageContainerSasToken)'
+     
+              # Retrieve the contents of the configuration file
+              $configuration = Get-Content -Path '$(Pipeline.Workspace)\cloudserviceproject\a\ServiceConfiguration.Cloud.cscfg' | Out-String
+     
+              # Retrieve the cloud service definition
+              $cloudService = Get-AzCloudService -ResourceGroupName "{your resource group name here}" -CloudServiceName "{your Cloud Services Extended Support name here}"
+     
+              # Update the cloud service
+              $cloudService.Configuration = $configuration
+              $cloudService.PackageUrl = $cspkgUrl
+              $cloudService | Update-AzCloudService
+            azurePowerShellVersion: LatestVersion    
